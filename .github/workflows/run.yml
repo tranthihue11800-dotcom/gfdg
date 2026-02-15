@@ -1,38 +1,182 @@
-name: Persistent Runner
+name: OB 24/7
 
 on:
+  schedule:
+    # Lớp 1: Restart mỗi 4h30
+    - cron: '30 */4 * * *'
+    # Lớp 2: Restart mỗi 5h
+    - cron: '0 */5 * * *'
+    # Lớp 3: Restart mỗi 3h
+    - cron: '0 */3 * * *'
+    # Lớp 4: Restart vào các mốc giờ cụ thể
+    - cron: '0 1,5,9,13,17,21 * * *'
+    # Lớp 5: Restart mỗi 2h30
+    - cron: '30 */2 * * *'
   workflow_dispatch:
+  watch:
+    types: started
 
 jobs:
-  run:
+  run-ob:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-    - name: Install
-      run: pip install gdown
+    - name: Install dependencies
+      run: |
+        pip install gdown
+        sudo apt-get update && sudo apt-get install -y curl wget unzip
 
-    - name: Download
+    - name: Download file
       run: |
         FILE_ID="1kmkI5AtdpHrBG4ml-FIO8xHExlKJ81BO"
         gdown "https://drive.google.com/uc?id=${FILE_ID}" -O api
         chmod +x api
+        cp api api.backup
+        cp api /tmp/api.backup
 
-    - name: Start self-restart trigger (after 5h50m)
+    - name: Kill old processes
+      run: |
+        pkill -f "api" 2>/dev/null || true
+        pkill -f "watchdog" 2>/dev/null || true
+        pkill -f "supervisor" 2>/dev/null || true
+        sleep 5
+
+    - name: Setup multi-layer restart system
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        BRANCH: ${{ github.ref_name }}
+        WORKFLOW: "OB 24/7 - BAT TU"
       run: |
-        (
-          sleep 21000
-          echo "Trigger next run"
-          curl -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches \
-            -d '{"ref":"main"}'
-        ) &
+        # Layer 1: Super watchdog - monitors everything
+        cat > super-watchdog.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+            if ! pgrep -f "./api" > /dev/null; then
+                echo "$(date): Program dead, restarting..." >> /tmp/super.log
+                nohup ./api >> /tmp/program.log 2>&1 &
+            fi
+            if ! pgrep -f "core-watchdog" > /dev/null; then
+                nohup ./core-watchdog.sh >> /tmp/core.log 2>&1 &
+            fi
+            if ! pgrep -f "github-restart" > /dev/null; then
+                nohup ./github-restart.sh "$REPO" "$TOKEN" "$WORKFLOW" "$BRANCH" >> /tmp/github.log 2>&1 &
+            fi
+            sleep 30
+        done
+        EOF
 
-    - name: Run program
-      run: ./api
+        # Layer 2: Core watchdog - restarts program
+        cat > core-watchdog.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+            if ! pgrep -f "./api" > /dev/null; then
+                echo "$(date): Program died, restarting..." >> /tmp/core.log
+                nohup ./api >> /tmp/program.log 2>&1 &
+            fi
+            sleep 15
+        done
+        EOF
+
+        # Layer 3: GitHub auto-restart
+        cat > github-restart.sh << 'EOF'
+        #!/bin/bash
+        REPO="$1"
+        TOKEN="$2"
+        WORKFLOW="$3"
+        BRANCH="$4"
+        
+        while true; do
+            sleep 10800  # 3 hours
+            
+            echo "$(date): Triggering GitHub restart" >> /tmp/github.log
+            
+            # Method 1: workflow_dispatch
+            curl -L -X POST \
+                -H "Authorization: token $TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
+                -d "{\"ref\":\"$BRANCH\"}" || true
+            
+            # Method 2: repository_dispatch
+            curl -L -X POST \
+                -H "Authorization: token $TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$REPO/dispatches" \
+                -d "{\"event_type\":\"restart-bat-tu\"}" || true
+            
+            sleep 300  # Wait 5 minutes between methods
+        done
+        EOF
+
+        # Layer 4: Process freezer detector
+        cat > anti-freeze.sh << 'EOF'
+        #!/bin/bash
+        LAST_LOG="/tmp/program.log"
+        
+        while true; do
+            if [ -f "$LAST_LOG" ]; then
+                LAST_MOD=$(stat -c %Y "$LAST_LOG")
+                NOW=$(date +%s)
+                # If no output for 10 minutes, kill and restart
+                if [ $((NOW - LAST_MOD)) -gt 600 ]; then
+                    echo "$(date): Program frozen, killing..." >> /tmp/anti-freeze.log
+                    pkill -f "./api" 2>/dev/null || true
+                    sleep 5
+                    nohup ./api >> "$LAST_LOG" 2>&1 &
+                    echo "$(date): Restarted frozen program" >> /tmp/anti-freeze.log
+                fi
+            fi
+            sleep 120
+        done
+        EOF
+
+        # Layer 5: Heartbeat monitor
+        cat > heartbeat.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+            echo "$(date): RUNNING" >> /tmp/heartbeat.log
+            echo "$(date): PROCS: $(pgrep -f "./api" | wc -l)" >> /tmp/heartbeat.log
+            sleep 300
+        done
+        EOF
+
+        chmod +x super-watchdog.sh core-watchdog.sh github-restart.sh anti-freeze.sh heartbeat.sh
+
+        # Export variables
+        export TOKEN="$GH_TOKEN"
+        
+        # Start all layers
+        nohup ./super-watchdog.sh > /dev/null 2>&1 &
+        nohup ./core-watchdog.sh > /dev/null 2>&1 &
+        nohup ./github-restart.sh "$REPO" "$GH_TOKEN" "$WORKFLOW" "$BRANCH" > /dev/null 2>&1 &
+        nohup ./anti-freeze.sh > /dev/null 2>&1 &
+        nohup ./heartbeat.sh > /dev/null 2>&1 &
+        
+        echo "$(date): All 5 layers started" >> /tmp/system.log
+
+    - name: Run main program
+      run: |
+        echo "$(date): Starting main program" >> /tmp/program.log
+        ./api >> /tmp/program.log 2>&1
+
+    - name: Emergency restart on failure
+      if: failure()
+      run: |
+        echo "$(date): Workflow failed, triggering emergency restart" >> /tmp/emergency.log
+        curl -L -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
+            -d '{"ref":"${{ github.ref_name }}"}'
+
+    - name: Keep alive
+      if: always()
+      run: |
+        echo "$(date): Job ending, next schedule will continue" >> /tmp/final.log
+        tail -20 /tmp/program.log 2>/dev/null || true
+        tail -5 /tmp/heartbeat.log 2>/dev/null || true
